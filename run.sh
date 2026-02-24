@@ -21,6 +21,7 @@ if [ -z "$SCRIPT" ]; then
     echo "  restore           - Repare les VHDX et recupere sur le Mac"
     echo "  build-parallels   - Construit un disque data Parallels"
     echo "  build-qemu        - Construit un disque MBR bootable QEMU"
+    echo "  extract-ntfs      - Extrait la partition NTFS montable sur Mac"
     exit 1
 fi
 
@@ -28,9 +29,10 @@ case "$SCRIPT" in
     restore)        TARGET="${SCRIPT_DIR}/restore_backup_to_vm.sh" ;;
     build-parallels) TARGET="${SCRIPT_DIR}/build_parallels_data.sh" ;;
     build-qemu)     TARGET="${SCRIPT_DIR}/build_qemu_bootable.sh" ;;
+    extract-ntfs)   TARGET="${SCRIPT_DIR}/extract_ntfs.sh" ;;
     *)
         echo "Erreur: script inconnu '$SCRIPT'"
-        echo "Choix: restore, build-parallels, build-qemu"
+        echo "Choix: restore, build-parallels, build-qemu, extract-ntfs"
         exit 1
         ;;
 esac
