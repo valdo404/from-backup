@@ -5,17 +5,25 @@ set -euo pipefail
 : "${VM_NAME:?Erreur: VM_NAME non defini (ex: export VM_NAME='Windows 11')}"
 : "${RECON_DIR:?Erreur: RECON_DIR non defini - repertoire de reconstruction sur le Mac (ex: export RECON_DIR='/chemin/vers/reconstruction')}"
 : "${RECON_SHARE:?Erreur: RECON_SHARE non defini - chemin UNC du repertoire de reconstruction vu depuis la VM (ex: export RECON_SHARE='\\\\Mac\\Home\\from-backup\\reconstruction')}"
+: "${MANIFEST_FILE:?Erreur: MANIFEST_FILE non defini - chemin du manifeste genere par restore_backup_to_vm.sh}"
+
+# Verifier que le manifeste existe
+if [ ! -f "$MANIFEST_FILE" ]; then
+    echo "Erreur: manifeste introuvable: $MANIFEST_FILE"
+    echo "Lancez d'abord restore_backup_to_vm.sh pour le generer."
+    exit 1
+fi
+
+# Verifier les outils requis
+for tool in qemu-img sgdisk prlctl; do
+    if ! command -v "$tool" &>/dev/null; then
+        echo "Erreur: $tool introuvable. Installez-le d'abord."
+        exit 1
+    fi
+done
 
 # Configuration derivee
 VM_BACKUP_DIR="C:\\WindowsImageBackup"
-
-# Detecter les fichiers VHDX disponibles sur la VM
-echo "  Detection des VHDX sur la VM ..."
-VHDX_LIST=$(prlctl exec "$VM_NAME" cmd /c "dir \"$VM_BACKUP_DIR\\*.vhdx\" /s /b" 2>/dev/null | tr -d '\r')
-if [ -z "$VHDX_LIST" ]; then
-    echo "Erreur: aucun fichier VHDX trouve dans $VM_BACKUP_DIR sur la VM '$VM_NAME'"
-    exit 1
-fi
 
 exec_vm() {
     prlctl exec "$VM_NAME" cmd /c "$*"
@@ -30,9 +38,6 @@ echo "=== 1/4 - Recuperation du backup repare depuis la VM ==="
 echo "  Robocopy inverse : VM -> Mac ..."
 exec_vm "robocopy \"$VM_BACKUP_DIR\" \"$RECON_SHARE\" /MIR /MT:16 /J /R:3 /W:5 /NP" || true
 
-echo "  Verification des fichiers ..."
-ls -lhR "$RECON_DIR"
-
 # Trouver le sous-dossier contenant les VHDX
 VHDX_DIR=$(find "$RECON_DIR" -name "*.vhdx" -print -quit | xargs dirname)
 if [ -z "$VHDX_DIR" ]; then
@@ -41,121 +46,210 @@ if [ -z "$VHDX_DIR" ]; then
 fi
 echo "  VHDX trouves dans : $VHDX_DIR"
 
-# Lister les VHDX par taille croissante
-VHDX_FILES=$(ls -S "$VHDX_DIR"/*.vhdx | xargs -n1 basename)
-VHDX_DATA=$(ls -S "$VHDX_DIR"/*.vhdx | head -1 | xargs basename)
-echo "  VHDX principal (donnees) : $VHDX_DATA"
-
 # ==========================================================================
 echo ""
-echo "=== 2/4 - Conversion des VHDX en raw ==="
+echo "=== 2/4 - Conversion des VHDX en raw et analyse GPT ==="
 # ==========================================================================
-# Chaque VHDX contient un mini-disque GPT avec:
-#   - Partition 1: MSR 15 Mo (a ignorer)
-#   - Partition 2: les donnees
 
-for VHDX in $VHDX_FILES; do
-    RAW="${RECON_DIR}/${VHDX%.vhdx}.raw"
-    if [ -f "$RAW" ]; then
-        echo "  $RAW existe deja, skip"
+# Lire le manifeste pour identifier le role de chaque VHDX
+echo "  Lecture du manifeste : $MANIFEST_FILE"
+
+# Extraire les VHDX et leurs roles depuis le manifeste
+# Format attendu: filename + partitions[].role
+VHDX_EFI=""
+VHDX_MSR=""
+VHDX_WINDOWS=""
+VHDX_RECOVERY=""
+
+# Parser le manifeste (compatible sans jq)
+current_file=""
+while IFS= read -r line; do
+    # Detecter le nom du fichier
+    if echo "$line" | grep -q '"filename"'; then
+        current_file=$(echo "$line" | sed 's/.*"filename": *"\([^"]*\)".*/\1/')
+    fi
+    # Detecter le role
+    if echo "$line" | grep -q '"role"'; then
+        role=$(echo "$line" | sed 's/.*"role": *"\([^"]*\)".*/\1/')
+        case "$role" in
+            efi)      VHDX_EFI="$current_file" ;;
+            msr)      VHDX_MSR="$current_file" ;;
+            windows)  VHDX_WINDOWS="$current_file" ;;
+            recovery) VHDX_RECOVERY="$current_file" ;;
+            data)     # Si pas de windows identifie, data devient windows
+                      [ -z "$VHDX_WINDOWS" ] && VHDX_WINDOWS="$current_file" ;;
+        esac
+    fi
+done < "$MANIFEST_FILE"
+
+echo "  EFI:      ${VHDX_EFI:-non detecte}"
+echo "  Windows:  ${VHDX_WINDOWS:-non detecte}"
+echo "  Recovery: ${VHDX_RECOVERY:-non detecte}"
+
+if [ -z "$VHDX_WINDOWS" ]; then
+    echo "Erreur: impossible d'identifier la partition Windows dans le manifeste"
+    exit 1
+fi
+
+# Convertir les VHDX en raw
+declare -A RAW_FILES
+for role in efi windows recovery; do
+    eval "vhdx=\${VHDX_$(echo $role | tr a-z A-Z):-}"
+    [ -z "$vhdx" ] && continue
+
+    raw="${RECON_DIR}/${vhdx%.vhdx}.raw"
+    RAW_FILES[$role]="$raw"
+
+    if [ -f "$raw" ]; then
+        echo "  $raw existe deja, skip"
         continue
     fi
-    echo "  Conversion de $VHDX -> raw ..."
-    qemu-img convert -f vhdx -O raw "$VHDX_DIR/$VHDX" "$RAW"
+    echo "  Conversion de $vhdx -> raw ..."
+    qemu-img convert -f vhdx -O raw "$VHDX_DIR/$vhdx" "$raw"
 done
 
 # ==========================================================================
 echo ""
 echo "=== 3/4 - Assemblage du disque GPT complet ==="
 # ==========================================================================
-# Structure GPT Windows standard:
-#   Partition 1: EFI System    (FAT32)  - plus petit VHDX (~76 Mo)
-#   Partition 2: MSR           (Microsoft Reserved) - 16 Mo vide
-#   Partition 3: Windows       (NTFS)   - plus gros VHDX (~90 Go)
-#   Partition 4: Recovery      (NTFS)   - VHDX moyen (~488 Mo)
 
-# Trier les raw par taille pour identifier boot (petit), recovery (moyen), data (gros)
-RAW_FILES=$(ls -S "$RECON_DIR"/*.raw)
-RAW_DATA=$(echo "$RAW_FILES" | head -1)
-RAW_RECOVERY=$(echo "$RAW_FILES" | head -2 | tail -1)
-RAW_BOOT=$(echo "$RAW_FILES" | tail -1)
+# Parser la table GPT de chaque raw pour trouver le vrai offset de la partition utile
+get_partition_info() {
+    local raw_file="$1"
+    # sgdisk --print retourne les partitions avec start sector et end sector
+    sgdisk --print "$raw_file" 2>/dev/null | awk '
+        /^ *[0-9]/ {
+            num=$1; start=$2; end=$3; size=$4; unit=$5; code=$6
+            # Ignorer MSR (code 0C01) et les partitions reservees
+            if (code != "0C01" && code != "E3C9") {
+                print start, end, code
+            }
+        }
+    ' | head -1
+}
 
-echo "  EFI (boot):    $(basename "$RAW_BOOT")"
-echo "  Recovery:      $(basename "$RAW_RECOVERY")"
-echo "  Data (Windows): $(basename "$RAW_DATA")"
+SEC=512
+ALIGN=$((1024 * 1024))
 
-# Chaque raw a: 17KB offset GPT, 15MB MSR, puis la partition utile a offset 16MB
-PART_OFFSET=$((16 * 1024 * 1024))
+# Extraire l'offset et la taille reels de chaque partition utile
+declare -A PART_START_BYTES PART_SIZE_BYTES
 
-# Tailles des partitions utiles (taille raw - 16 Mo d'overhead GPT+MSR)
-BOOT_RAW_SIZE=$(stat -f%z "$RAW_BOOT")
-RECOVERY_RAW_SIZE=$(stat -f%z "$RAW_RECOVERY")
-DATA_RAW_SIZE=$(stat -f%z "$RAW_DATA")
+for role in efi windows recovery; do
+    raw="${RAW_FILES[$role]:-}"
+    [ -z "$raw" ] && continue
 
-BOOT_PART_SIZE=$((BOOT_RAW_SIZE - PART_OFFSET))
-RECOVERY_PART_SIZE=$((RECOVERY_RAW_SIZE - PART_OFFSET))
-DATA_PART_SIZE=$((DATA_RAW_SIZE - PART_OFFSET))
+    info=$(get_partition_info "$raw")
+    if [ -z "$info" ]; then
+        echo "Erreur: impossible de lire la table GPT de $raw"
+        exit 1
+    fi
 
-echo "  Taille partition EFI:      $((BOOT_PART_SIZE / 1024 / 1024)) Mo"
-echo "  Taille partition Recovery:  $((RECOVERY_PART_SIZE / 1024 / 1024)) Mo"
-echo "  Taille partition Data:      $((DATA_PART_SIZE / 1024 / 1024 / 1024)) Go"
+    start_sec=$(echo "$info" | awk '{print $1}')
+    end_sec=$(echo "$info" | awk '{print $2}')
+
+    start_bytes=$((start_sec * SEC))
+    size_bytes=$(((end_sec - start_sec + 1) * SEC))
+
+    PART_START_BYTES[$role]=$start_bytes
+    PART_SIZE_BYTES[$role]=$size_bytes
+
+    echo "  $role: offset=${start_bytes} octets, taille=$((size_bytes / 1024 / 1024)) Mo (secteurs $start_sec-$end_sec)"
+done
 
 # Calcul du disque final
-# GPT header: 1 Mo | EFI | MSR: 16Mo | Windows | Recovery | GPT backup: 1 Mo
 MSR_SIZE=$((16 * 1024 * 1024))
 GPT_OVERHEAD=$((2 * 1024 * 1024))  # 1 Mo debut + 1 Mo fin
-DISK_SIZE=$((GPT_OVERHEAD + BOOT_PART_SIZE + MSR_SIZE + DATA_PART_SIZE + RECOVERY_PART_SIZE))
+
+EFI_SIZE=${PART_SIZE_BYTES[efi]:-0}
+WIN_SIZE=${PART_SIZE_BYTES[windows]}
+REC_SIZE=${PART_SIZE_BYTES[recovery]:-0}
+
+DISK_SIZE=$((GPT_OVERHEAD + EFI_SIZE + MSR_SIZE + WIN_SIZE + REC_SIZE))
 
 DISK_RAW="${RECON_DIR}/windows_full.raw"
+echo ""
 echo "  Taille disque final: $((DISK_SIZE / 1024 / 1024 / 1024)) Go"
 echo "  Creation de $DISK_RAW ..."
 
 # Creer un fichier sparse de la bonne taille
 dd if=/dev/zero of="$DISK_RAW" bs=1 count=0 seek=$DISK_SIZE 2>/dev/null
 
-# Calcul des offsets (alignes sur 1 Mo)
-ALIGN=$((1024 * 1024))
-EFI_START=$ALIGN
-EFI_END=$((EFI_START + BOOT_PART_SIZE))
-MSR_START=$EFI_END
-MSR_END=$((MSR_START + MSR_SIZE))
-WIN_START=$MSR_END
-WIN_END=$((WIN_START + DATA_PART_SIZE))
-REC_START=$WIN_END
-REC_END=$((REC_START + RECOVERY_PART_SIZE))
-
-# Convertir en secteurs (512 octets)
-SEC=512
-EFI_START_S=$((EFI_START / SEC))
-EFI_END_S=$(((EFI_END / SEC) - 1))
-MSR_START_S=$((MSR_START / SEC))
-MSR_END_S=$(((MSR_END / SEC) - 1))
-WIN_START_S=$((WIN_START / SEC))
-WIN_END_S=$(((WIN_END / SEC) - 1))
-REC_START_S=$((REC_START / SEC))
-REC_END_S=$(((REC_END / SEC) - 1))
-
-echo "  Creation de la table GPT ..."
-sgdisk --zap-all "$DISK_RAW" > /dev/null 2>&1
+# Calcul des offsets dans le disque final (alignes sur 1 Mo)
+OFFSET=$ALIGN
+PART_NUM=1
 
 # Partition 1: EFI System
-sgdisk --new=1:${EFI_START_S}:${EFI_END_S} --typecode=1:EF00 --change-name=1:"EFI System" "$DISK_RAW"
-# Partition 2: Microsoft Reserved
-sgdisk --new=2:${MSR_START_S}:${MSR_END_S} --typecode=2:0C01 --change-name=2:"Microsoft Reserved" "$DISK_RAW"
-# Partition 3: Windows (Basic Data)
-sgdisk --new=3:${WIN_START_S}:${WIN_END_S} --typecode=3:0700 --change-name=3:"Windows" "$DISK_RAW"
-# Partition 4: Recovery
-sgdisk --new=4:${REC_START_S}:${REC_END_S} --typecode=4:2700 --change-name=4:"Recovery" --attributes=4:set:63 "$DISK_RAW"
+if [ "$EFI_SIZE" -gt 0 ]; then
+    EFI_START=$OFFSET
+    EFI_END=$((OFFSET + EFI_SIZE))
+    EFI_START_S=$((EFI_START / SEC))
+    EFI_END_S=$(((EFI_END / SEC) - 1))
+    sgdisk --new=${PART_NUM}:${EFI_START_S}:${EFI_END_S} --typecode=${PART_NUM}:EF00 --change-name=${PART_NUM}:"EFI System" "$DISK_RAW"
+    OFFSET=$EFI_END
+    PART_NUM=$((PART_NUM + 1))
+fi
 
+# Partition 2: Microsoft Reserved
+MSR_START=$OFFSET
+MSR_END=$((OFFSET + MSR_SIZE))
+MSR_START_S=$((MSR_START / SEC))
+MSR_END_S=$(((MSR_END / SEC) - 1))
+sgdisk --new=${PART_NUM}:${MSR_START_S}:${MSR_END_S} --typecode=${PART_NUM}:0C01 --change-name=${PART_NUM}:"Microsoft Reserved" "$DISK_RAW"
+OFFSET=$MSR_END
+PART_NUM=$((PART_NUM + 1))
+
+# Partition 3: Windows
+WIN_START=$OFFSET
+WIN_END=$((OFFSET + WIN_SIZE))
+WIN_START_S=$((WIN_START / SEC))
+WIN_END_S=$(((WIN_END / SEC) - 1))
+sgdisk --new=${PART_NUM}:${WIN_START_S}:${WIN_END_S} --typecode=${PART_NUM}:0700 --change-name=${PART_NUM}:"Windows" "$DISK_RAW"
+WIN_PART_NUM=$PART_NUM
+OFFSET=$WIN_END
+PART_NUM=$((PART_NUM + 1))
+
+# Partition 4: Recovery
+if [ "$REC_SIZE" -gt 0 ]; then
+    REC_START=$OFFSET
+    REC_END=$((OFFSET + REC_SIZE))
+    REC_START_S=$((REC_START / SEC))
+    REC_END_S=$(((REC_END / SEC) - 1))
+    sgdisk --new=${PART_NUM}:${REC_START_S}:${REC_END_S} --typecode=${PART_NUM}:2700 --change-name=${PART_NUM}:"Recovery" --attributes=${PART_NUM}:set:63 "$DISK_RAW"
+    OFFSET=$REC_END
+    PART_NUM=$((PART_NUM + 1))
+fi
+
+echo ""
+echo "  Table GPT finale :"
 sgdisk --print "$DISK_RAW"
 
+echo ""
 echo "  Ecriture des partitions dans le disque ..."
-# EFI
-dd if="$RAW_BOOT" of="$DISK_RAW" bs=$ALIGN skip=$((PART_OFFSET / ALIGN)) seek=$((EFI_START / ALIGN)) conv=notrunc status=progress 2>&1
-# Windows
-dd if="$RAW_DATA" of="$DISK_RAW" bs=$ALIGN skip=$((PART_OFFSET / ALIGN)) seek=$((WIN_START / ALIGN)) conv=notrunc status=progress 2>&1
-# Recovery
-dd if="$RAW_RECOVERY" of="$DISK_RAW" bs=$ALIGN skip=$((PART_OFFSET / ALIGN)) seek=$((REC_START / ALIGN)) conv=notrunc status=progress 2>&1
+
+write_partition() {
+    local role="$1"
+    local dest_start="$2"
+    local raw="${RAW_FILES[$role]}"
+    local src_start="${PART_START_BYTES[$role]}"
+    local size="${PART_SIZE_BYTES[$role]}"
+
+    echo "  -> $role : $((size / 1024 / 1024)) Mo depuis offset $src_start"
+    dd if="$raw" of="$DISK_RAW" \
+        bs=$SEC \
+        skip=$((src_start / SEC)) \
+        seek=$((dest_start / SEC)) \
+        count=$((size / SEC)) \
+        conv=notrunc status=progress 2>&1
+}
+
+[ "$EFI_SIZE" -gt 0 ] && write_partition "efi" "$EFI_START"
+write_partition "windows" "$WIN_START"
+[ "$REC_SIZE" -gt 0 ] && write_partition "recovery" "$REC_START"
+
+# Verification de la table GPT du disque final
+echo ""
+echo "  Verification de la table GPT ..."
+sgdisk --verify "$DISK_RAW"
 
 # ==========================================================================
 echo ""
@@ -168,7 +262,7 @@ qemu-img convert -f raw -O parallels "$DISK_RAW" "$HDD_FILE"
 
 echo ""
 echo "  Nettoyage des fichiers intermediaires ..."
-rm -f "${RECON_DIR}"/*.raw
+rm -f "${RAW_FILES[efi]:-}" "${RAW_FILES[windows]}" "${RAW_FILES[recovery]:-}" "$DISK_RAW"
 
 echo ""
 echo "=== Termine ==="
