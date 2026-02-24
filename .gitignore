@@ -1,0 +1,5 @@
+reconstruction/
+*.vhdx
+*.raw
+*.hdd
+*.log
