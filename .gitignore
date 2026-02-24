@@ -1,3 +1,4 @@
+.env
 reconstruction/
 *.vhdx
 *.raw
