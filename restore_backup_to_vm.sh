@@ -6,6 +6,8 @@ set -euo pipefail
 : "${BACKUP_SOURCE:?Erreur: BACKUP_SOURCE non defini - chemin UNC du backup vu depuis la VM (ex: export BACKUP_SOURCE='\\\\Mac\\Home\\mon_dossier\\WindowsImageBackup')}"
 : "${BACKUP_SUBDIR:?Erreur: BACKUP_SUBDIR non defini - sous-dossier contenant les VHDX (ex: export BACKUP_SUBDIR='MON-PC\\Backup 2026-02-16 124141')}"
 : "${MANIFEST_FILE:?Erreur: MANIFEST_FILE non defini - chemin du fichier manifeste a generer (ex: export MANIFEST_FILE='/chemin/vers/manifest.json')}"
+: "${RECON_DIR:?Erreur: RECON_DIR non defini - repertoire de reconstruction sur le Mac (ex: export RECON_DIR='/chemin/vers/reconstruction')}"
+: "${RECON_SHARE:?Erreur: RECON_SHARE non defini - chemin UNC du repertoire vu depuis la VM (ex: export RECON_SHARE='\\\\Mac\\Home\\from-backup\\reconstruction')}"
 
 # Configuration derivee
 DEST="C:\\WindowsImageBackup"
@@ -16,14 +18,14 @@ exec_vm() {
     prlctl exec "$VM_NAME" cmd /c "$*"
 }
 
-echo "=== 1/4 - Copie avec robocopy ==="
+echo "=== 1/5 - Copie avec robocopy ==="
 echo "Source : $BACKUP_SOURCE"
 echo "Destination : $DEST"
 
 exec_vm "mkdir \"$DEST\" 2>nul & robocopy \"$BACKUP_SOURCE\" \"$DEST\" /MIR /MT:16 /J /R:3 /W:5 /NP /NFL /NDL" || true
 
 echo ""
-echo "=== 2/4 - Suppression du flag sparse et decompression NTFS ==="
+echo "=== 2/5 - Suppression du flag sparse et decompression NTFS ==="
 
 for VHDX in $(exec_vm "dir \"$VHDX_DIR\\*.vhdx\" /b" 2>/dev/null); do
     VHDX=$(echo "$VHDX" | tr -d '\r')
@@ -34,7 +36,7 @@ for VHDX in $(exec_vm "dir \"$VHDX_DIR\\*.vhdx\" /b" 2>/dev/null); do
 done
 
 echo ""
-echo "=== 3/4 - Montage et chkdsk /f sur tous les VHDX ==="
+echo "=== 3/5 - Montage et chkdsk /f sur tous les VHDX ==="
 
 # Initialiser le manifeste JSON
 echo '{' > "$MANIFEST_FILE"
@@ -144,11 +146,31 @@ echo '  ]' >> "$MANIFEST_FILE"
 echo '}' >> "$MANIFEST_FILE"
 
 echo ""
-echo "=== 4/4 - Manifeste genere ==="
+echo "=== 4/5 - Manifeste genere ==="
 echo "  $MANIFEST_FILE"
 cat "$MANIFEST_FILE"
 
 echo ""
+echo "=== 5/5 - Recuperation du backup repare depuis la VM ==="
+
+mkdir -p "$RECON_DIR"
+echo "  Robocopy inverse : VM -> Mac ..."
+exec_vm "robocopy \"$DEST\" \"$RECON_SHARE\" /MIR /MT:16 /J /R:3 /W:5 /NP" || true
+
+# Verifier qu'on a bien des VHDX
+VHDX_RESULT=$(find "$RECON_DIR" -name "*.vhdx" -print -quit 2>/dev/null)
+if [ -z "$VHDX_RESULT" ]; then
+    echo "Erreur: aucun fichier VHDX trouve dans $RECON_DIR apres la copie"
+    exit 1
+fi
+
+# Copier le manifeste dans le repertoire de reconstruction
+cp "$MANIFEST_FILE" "$RECON_DIR/manifest.json" 2>/dev/null || true
+
+echo "  Fichiers recuperes :"
+ls -lh "$(dirname "$VHDX_RESULT")"/*.vhdx
+
+echo ""
 echo "=== Termine ==="
-echo "Tous les VHDX ont ete verifies et corriges."
-echo "Manifeste pret pour reconstruct_disk.sh"
+echo "VHDX repares et recuperes dans : $RECON_DIR"
+echo "Prochaine etape : ./build_parallels_data.sh ou ./build_qemu_bootable.sh"

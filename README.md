@@ -15,16 +15,13 @@ These issues can only be fixed with Windows-native tools (`fsutil`, `compact`, `
 
 ### `restore_backup_to_vm.sh`
 
-Copies the backup into the VM and repairs the VHDX files:
+End-to-end repair pipeline:
 
 1. **Robocopy** the backup into the VM (`/MIR /MT:16 /J` for max throughput)
 2. **Desparse + decompress** all VHDX files
 3. **Mount + chkdsk /f** on every partition of every VHDX
 4. **Generate a manifest** (`manifest.json`) describing each VHDX, its partitions, filesystems and roles
-
-### `retrieve_from_vm.sh`
-
-Copies the repaired VHDX files back from the VM to the Mac via robocopy.
+5. **Robocopy back** the repaired files to the Mac
 
 ### `build_parallels_data.sh`
 
@@ -63,28 +60,25 @@ source .env
 
 | Variable | Used by | Description |
 |---|---|---|
-| `VM_NAME` | restore, retrieve | Parallels VM name |
+| `VM_NAME` | restore | Parallels VM name |
 | `BACKUP_SOURCE` | restore | UNC path to the backup as seen from the VM |
 | `BACKUP_SUBDIR` | restore | Subfolder containing the VHDX files |
-| `MANIFEST_FILE` | all | Path to the manifest (written by restore, read by others) |
-| `RECON_DIR` | retrieve, build | Local path for reconstruction workspace |
-| `RECON_SHARE` | retrieve | UNC path to `RECON_DIR` as seen from the VM |
+| `MANIFEST_FILE` | all | Path to the manifest (written by restore, read by build) |
+| `RECON_DIR` | all | Local path for reconstruction workspace |
+| `RECON_SHARE` | restore | UNC path to `RECON_DIR` as seen from the VM |
 
 ## Usage
 
 ```bash
 source .env
 
-# Step 1: Repair VHDX files via the VM
+# Step 1: Repair VHDX files and retrieve them
 ./restore_backup_to_vm.sh
 
-# Step 2: Copy repaired files back to Mac
-./retrieve_from_vm.sh
-
-# Step 3a: Build a data disk for Parallels
+# Step 2a: Build a data disk for Parallels
 ./build_parallels_data.sh
 
-# Step 3b: Or build a bootable disk for QEMU
+# Step 2b: Or build a bootable disk for QEMU
 ./build_qemu_bootable.sh
 ```
 
