@@ -1,6 +1,6 @@
 # from-backup
 
-Restore a Windows Image Backup (VHDX) to a bootable Parallels virtual disk, using a Parallels Windows VM as an intermediary for NTFS repair.
+Restore a Windows Image Backup (VHDX) to a usable virtual disk, using a Parallels Windows VM as an intermediary for NTFS repair.
 
 ## Why?
 
@@ -9,7 +9,7 @@ Windows Image Backup produces per-partition VHDX files that are often:
 - **NTFS-compressed** — same issue
 - **Corrupted** — MFT/bitmap errors from incomplete backups
 
-These issues can only be fixed with Windows-native tools (`fsutil`, `compact`, `chkdsk`). This toolset automates the repair via a running Parallels VM, then reassembles the partitions into a single bootable GPT disk.
+These issues can only be fixed with Windows-native tools (`fsutil`, `compact`, `chkdsk`). This toolset automates the repair via a running Parallels VM, then reassembles the partitions into a usable disk.
 
 ## Scripts
 
@@ -18,21 +18,31 @@ These issues can only be fixed with Windows-native tools (`fsutil`, `compact`, `
 Copies the backup into the VM and repairs the VHDX files:
 
 1. **Robocopy** the backup into the VM (`/MIR /MT:16 /J` for max throughput)
-2. **Desparse + decompress** all VHDX files (`fsutil sparse setflag 0` + `compact /u`)
+2. **Desparse + decompress** all VHDX files
 3. **Mount + chkdsk /f** on every partition of every VHDX
-4. **Generate a manifest** (`manifest.json`) describing each VHDX, its partitions, filesystems and roles (EFI, Windows, Recovery)
+4. **Generate a manifest** (`manifest.json`) describing each VHDX, its partitions, filesystems and roles
 
-### `reconstruct_disk.sh`
+### `retrieve_from_vm.sh`
 
-Retrieves the repaired files and builds a bootable Parallels disk:
+Copies the repaired VHDX files back from the VM to the Mac via robocopy.
 
-1. **Robocopy** the repaired backup back to the Mac
-2. **Read the manifest** to identify partition roles (no guessing by size)
-3. **Convert** each VHDX to raw with `qemu-img`
-4. **Parse GPT tables** of each raw image with `sgdisk` to find exact partition offsets
-5. **Assemble** a full GPT disk (EFI + MSR + Windows + Recovery) with `sgdisk` + `dd`
-6. **Verify** the final GPT table with `sgdisk --verify`
-7. **Convert** to Parallels HDD format with `qemu-img`
+### `build_parallels_data.sh`
+
+Builds a **data-only GPT disk** (not bootable) for Parallels:
+- Reads the manifest to identify partitions
+- Parses actual GPT offsets from each VHDX with `sgdisk`
+- Assembles Windows + Recovery partitions into a single disk
+- Converts to Parallels HDD format
+- Attach as a secondary disk to access files
+
+### `build_qemu_bootable.sh`
+
+Builds a **bootable MBR disk** for QEMU (x86_64 emulation on Apple Silicon):
+- Reads the manifest to identify partitions
+- Creates an MBR disk with System Reserved + Windows + Recovery
+- Installs MBR bootstrap for BIOS boot
+- Converts to qcow2 (compressed)
+- Boot with `qemu-system-x86_64`
 
 ## Prerequisites
 
@@ -42,8 +52,6 @@ Retrieves the repaired files and builds a bootable Parallels disk:
 - `sgdisk` (`brew install gptfdisk`)
 
 ## Configuration
-
-Copy `.env.example` and set the required variables:
 
 ```bash
 cp .env.example .env
@@ -55,26 +63,30 @@ source .env
 
 | Variable | Used by | Description |
 |---|---|---|
-| `VM_NAME` | both | Parallels VM name (e.g. `Windows 11`) |
+| `VM_NAME` | restore, retrieve | Parallels VM name |
 | `BACKUP_SOURCE` | restore | UNC path to the backup as seen from the VM |
 | `BACKUP_SUBDIR` | restore | Subfolder containing the VHDX files |
-| `MANIFEST_FILE` | both | Path to the manifest file (written by restore, read by reconstruct) |
-| `RECON_DIR` | reconstruct | Local path for reconstruction workspace |
-| `RECON_SHARE` | reconstruct | UNC path to `RECON_DIR` as seen from the VM |
+| `MANIFEST_FILE` | all | Path to the manifest (written by restore, read by others) |
+| `RECON_DIR` | retrieve, build | Local path for reconstruction workspace |
+| `RECON_SHARE` | retrieve | UNC path to `RECON_DIR` as seen from the VM |
 
 ## Usage
 
 ```bash
 source .env
 
-# Step 1: Copy backup to VM, repair VHDX files, generate manifest
+# Step 1: Repair VHDX files via the VM
 ./restore_backup_to_vm.sh
 
-# Step 2: Retrieve repaired files, build Parallels disk
-./reconstruct_disk.sh
-```
+# Step 2: Copy repaired files back to Mac
+./retrieve_from_vm.sh
 
-The resulting `reconstruction/windows_restored.hdd` can be attached to a new Parallels VM (EFI boot mode).
+# Step 3a: Build a data disk for Parallels
+./build_parallels_data.sh
+
+# Step 3b: Or build a bootable disk for QEMU
+./build_qemu_bootable.sh
+```
 
 ## License
 
